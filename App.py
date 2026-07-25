@@ -56,16 +56,18 @@ def buscar_metadados_spotify(track_id):
         return None, None
 
 def buscar_letra_genius(nome_musica, nome_artista):
-    """Busca a letra da música no Genius."""
+    """Busca a letra da música no Genius e exibe erros detalhados."""
     try:
         musica = genius.search_song(nome_musica, nome_artista)
         if musica:
-            # O Genius costuma adicionar um texto no final, limpamos isso
             letra_limpa = re.sub(r'\d*Embed$', '', musica.lyrics)
             return letra_limpa
         return None
     except Exception as e:
-        st.error("Erro ao buscar a letra no Genius.")
+        # Mostra o erro técnico na tela do app
+        st.error(f"Erro técnico detalhado do Genius: {e}")
+        # Força o erro a aparecer no terminal/log do Streamlit Cloud
+        print(f"ERRO GENIUS: {e}") 
         return None
 
 # ==========================================
