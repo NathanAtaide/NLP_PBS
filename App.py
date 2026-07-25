@@ -1,7 +1,7 @@
 import streamlit as st
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-import lyricsgenius
+import requests
 import re
 
 # ==========================================
@@ -12,35 +12,21 @@ st.title("🎵 Análise de Letras (NLP)")
 st.write("Cole o link de uma música do Spotify para extrair a letra e realizar o processamento de linguagem natural.")
 
 # ==========================================
-# Autenticação das APIs
+# Autenticação do Spotify
 # ==========================================
 @st.cache_resource
-def iniciar_clientes_api():
+def iniciar_spotify():
     try:
-        # Credenciais do Spotify
         auth_manager = SpotifyClientCredentials(
             client_id=st.secrets["SPOTIFY_CLIENT_ID"],
             client_secret=st.secrets["SPOTIFY_CLIENT_SECRET"]
         )
-        spotify_client = spotipy.Spotify(auth_manager=auth_manager)
-        
-        # Credencial do Genius
-        # Credencial do Genius com maior tolerância a falhas e nuvem
-        genius_client = lyricsgenius.Genius(
-            st.secrets["GENIUS_ACCESS_TOKEN"],
-            timeout=15,           # Aumenta o tempo de espera (default é 5s)
-            retries=3,            # Tenta 3 vezes antes de falhar
-            skip_non_songs=True   # Evita buscar coisas que não são músicas
-        )
-        genius_client.verbose = False
-        genius_client.remove_section_headers = True
-        
-        return spotify_client, genius_client
+        return spotipy.Spotify(auth_manager=auth_manager)
     except Exception as e:
-        st.error(f"Erro ao autenticar APIs. Verifique suas chaves no secrets.toml. Detalhe: {e}")
-        return None, None
+        st.error(f"Erro ao autenticar Spotify. Verifique suas chaves. Detalhe: {e}")
+        return None
 
-sp, genius = iniciar_clientes_api()
+sp = iniciar_spotify()
 
 # ==========================================
 # Funções Principais
@@ -57,23 +43,31 @@ def buscar_metadados_spotify(track_id):
         nome_musica = track_info['name']
         nome_artista = track_info['artists'][0]['name']
         return nome_musica, nome_artista
-    except Exception as e:
-        st.error("Erro ao buscar informações no Spotify. Verifique se o link é válido.")
+    except Exception:
         return None, None
 
-def buscar_letra_genius(nome_musica, nome_artista):
-    """Busca a letra da música no Genius e exibe erros detalhados."""
+def buscar_letra_lrclib(nome_musica, nome_artista):
+    """Busca a letra da música na API pública LRCLIB."""
+    url = "https://lrclib.net/api/get"
+    params = {
+        "track_name": nome_musica,
+        "artist_name": nome_artista
+    }
+    # Declarar um User-Agent é uma boa prática para evitar bloqueios em APIs gratuitas
+    headers = {"User-Agent": "AppNLP_Streamlit_Python/1.0"}
+    
     try:
-        musica = genius.search_song(nome_musica, nome_artista)
-        if musica:
-            letra_limpa = re.sub(r'\d*Embed$', '', musica.lyrics)
-            return letra_limpa
-        return None
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            dados = response.json()
+            # plainLyrics traz a letra limpa, sem os tempos da legenda
+            letra = dados.get("plainLyrics")
+            return letra
+        else:
+            return None
     except Exception as e:
-        # Mostra o erro técnico na tela do app
-        st.error(f"Erro técnico detalhado do Genius: {e}")
-        # Força o erro a aparecer no terminal/log do Streamlit Cloud
-        print(f"ERRO GENIUS: {e}") 
+        st.error(f"Erro técnico na API de letras: {e}")
         return None
 
 # ==========================================
@@ -84,8 +78,8 @@ link_spotify = st.text_input("Link da música no Spotify:", placeholder="https:/
 if st.button("Extrair Letra e Analisar"):
     if not link_spotify:
         st.warning("Por favor, insira um link válido.")
-    elif sp is None or genius is None:
-        st.error("As APIs não estão configuradas corretamente.")
+    elif sp is None:
+        st.error("A API do Spotify não está configurada corretamente.")
     else:
         with st.spinner("Extraindo informações do Spotify..."):
             track_id = extrair_id_spotify(link_spotify)
@@ -97,7 +91,7 @@ if st.button("Extrair Letra e Analisar"):
                     st.success(f"Música encontrada: **{nome_musica}** - {nome_artista}")
                     
                     with st.spinner("Buscando letra da música..."):
-                        letra = buscar_letra_genius(nome_musica, nome_artista)
+                        letra = buscar_letra_lrclib(nome_musica, nome_artista)
                         
                         if letra:
                             st.subheader("Letra Original")
@@ -112,6 +106,6 @@ if st.button("Extrair Letra e Analisar"):
                             st.info("O texto da letra está armazenado na variável `letra`. Insira as chamadas do seu modelo (NLTK, spaCy, Transformers) aqui.")
                             
                         else:
-                            st.error("Letra não encontrada no banco de dados do Genius.")
+                            st.error("Letra não encontrada no banco de dados. Tente uma música mais popular ou verifique a formatação do título.")
             else:
                 st.error("Formato de link do Spotify inválido.")
