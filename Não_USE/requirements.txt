@@ -1,7 +1,7 @@
-streamlit
+streamlit>=1.31
 spotipy
 requests
-spacy
+spacy>=3.7,<3.8
 nltk
 textstat
 langdetect

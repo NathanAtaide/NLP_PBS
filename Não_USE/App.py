@@ -1,422 +1,464 @@
-import streamlit as st
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-import requests
+"""
+App.py
+======
+NLP Lyrics Analyzer - Streamlit interface.
+
+The app turns an English song into a language lesson: it finds the
+contractions, reduced forms, phrasal verbs, idioms and slang that make
+authentic lyrics hard to understand, and explains each one in context.
+
+    App.py         -> user interface only
+    nlp_engine.py  -> all the NLP (matching, readability, sentiment)
+    lexicons.py    -> the reference dictionaries
+
+Run with:  streamlit run App.py
+"""
+
 import re
-import pandas as pd
-from collections import Counter
 
-# --- NLP Libraries ---
-import spacy
 import nltk
-from nltk.corpus import wordnet
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import textstat
-from langdetect import detect, detect_langs
+import pandas as pd
+import requests
+import spotipy
+import streamlit as st
 from deep_translator import GoogleTranslator
-from transformers import pipeline # Upgraded from NLTK VADER to Transformers
+from langdetect import DetectorFactory, detect
+from nltk.corpus import wordnet
+from spotipy.oauth2 import SpotifyClientCredentials
 
-# ==========================================
-# 1. PAGE CONFIGURATION & STATE MANAGEMENT
-# ==========================================
+import nlp_engine as engine
+from lexicons import CATEGORY_COLORS, CATEGORY_HELP, CATEGORY_ORDER
+
+# langdetect is randomised by default; a fixed seed makes the reported
+# language reproducible for the same lyrics.
+DetectorFactory.seed = 0
+
+# ==========================================================================
+# 1. PAGE CONFIGURATION & STATE
+# ==========================================================================
 st.set_page_config(page_title="NLP Lyrics Analyzer", page_icon="🎵", layout="wide")
 
-# Initialize Session State to prevent the page from resetting when clicking vocabulary buttons
-if "lyrics_data" not in st.session_state:
-    st.session_state.lyrics_data = None
-if "selected_vocab" not in st.session_state:
-    st.session_state.selected_vocab = None
+st.session_state.setdefault("lyrics_data", None)
+st.session_state.setdefault("selected_vocab", None)
 
-# ==========================================
-# 2. RESOURCE INITIALIZATION & CACHING
-# ==========================================
+
 @st.cache_resource
 def download_nltk_data():
-    nltk.download('wordnet', quiet=True)
-    nltk.download('punkt', quiet=True)
-    nltk.download('stopwords', quiet=True)
+    """Only WordNet is needed now - tokenisation is handled by spaCy."""
+    nltk.download("wordnet", quiet=True)
+    nltk.download("omw-1.4", quiet=True)
+
 
 download_nltk_data()
 
-@st.cache_resource
-def load_spacy_model():
-    try:
-        return spacy.load("en_core_web_sm")
-    except OSError:
-        st.error("SpaCy model not found. Please run: python -m spacy download en_core_web_sm")
-        return None
+nlp = engine.load_spacy()
+if nlp is None:
+    st.error(
+        "The spaCy English model is missing. Install it with:\n\n"
+        "`python -m spacy download en_core_web_sm`"
+    )
+    st.stop()
 
-nlp = load_spacy_model()
-
-@st.cache_resource
-def load_sentiment_model():
-    """
-    Loads a pre-trained Transformer model for sentiment analysis.
-    This model understands context much better than VADER (e.g., detecting sadness 
-    even if words like 'love' are present in songs like Drivers License).
-    """
-    return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-
-sentiment_pipeline = load_sentiment_model()
 
 @st.cache_resource
 def init_spotify():
     try:
         auth_manager = SpotifyClientCredentials(
             client_id=st.secrets["SPOTIFY_CLIENT_ID"],
-            client_secret=st.secrets["SPOTIFY_CLIENT_SECRET"]
+            client_secret=st.secrets["SPOTIFY_CLIENT_SECRET"],
         )
         return spotipy.Spotify(auth_manager=auth_manager)
-    except Exception as e:
-        st.error(f"Error authenticating Spotify: {e}")
+    except Exception as exc:
+        st.error(f"Error authenticating Spotify: {exc}")
         return None
+
 
 sp = init_spotify()
 
-# ==========================================
-# 3. CUSTOM DICTIONARIES & REGEX
-# ==========================================
-# Expanded Dictionary for slang and idioms
-SLANG_DICT = {
-    "so blue": "feeling very sad or depressed",
-    "blue": "sad or depressed",
-    "lit": "exciting or excellent",
-    "flex": "to show off",
-    "ghost": "to suddenly ignore someone",
-    "cap": "a lie",
-    "vibes": "emotional state or atmosphere",
-    "catch feelings": "start to fall in love"
-}
 
-# Expanded Regex patterns to catch standard contractions including "I'm", "'cause"
-CONTRACTIONS_DICT = {
-    r"(?i)\bi'm\b": "I am",
-    r"(?i)(?:\b|')cause\b": "because", # Catches "cause" and "'cause"
-    r"(?i)\bweren't\b": "were not",
-    r"(?i)\bain't\b": "am not / are not / is not",
-    r"(?i)\bdon't\b": "do not",
-    r"(?i)\bcan't\b": "cannot",
-    r"(?i)\bwon't\b": "will not",
-    r"(?i)\bit's\b": "it is / it has",
-    r"(?i)\bthat's\b": "that is",
-    r"(?i)\bgonna\b": "going to",
-    r"(?i)\bwanna\b": "want to",
-    r"(?i)\by'all\b": "you all",
-    r"(?i)\bgotta\b": "got to",
-    r"(?i)\boutta\b": "out of",
-    r"(?i)\btryna\b": "trying to"
-}
-
-# Dictionary to map specific meanings to extracted Phrasal Verbs
-PHRASAL_VERBS_DICT = {
-    "drive up": "To arrive in a vehicle.",
-    "give up": "To stop trying or surrender.",
-    "break down": "To lose control of emotions or stop functioning.",
-    "go through": "To endure or experience something difficult.",
-    "come back": "To return.",
-    "walk away": "To leave a situation.",
-    "look around": "To investigate one's surroundings."
-}
-
-# ==========================================
-# 4. API FETCHING FUNCTIONS
-# ==========================================
+# ==========================================================================
+# 2. API FETCHING
+# ==========================================================================
 def extract_spotify_id(url):
     match = re.search(r"track/([a-zA-Z0-9]+)", url)
     return match.group(1) if match else None
 
+
 def fetch_spotify_metadata_by_id(track_id):
     try:
         track_info = sp.track(track_id)
-        return track_info['name'], track_info['artists'][0]['name']
+        return track_info["name"], track_info["artists"][0]["name"]
     except Exception:
         return None, None
+
 
 def search_spotify_by_name(query):
     try:
-        results = sp.search(q=query, type='track', limit=1)
-        tracks = results['tracks']['items']
+        results = sp.search(q=query, type="track", limit=1)
+        tracks = results["tracks"]["items"]
         if tracks:
-            return tracks[0]['name'], tracks[0]['artists'][0]['name']
+            return tracks[0]["name"], tracks[0]["artists"][0]["name"]
         return None, None
     except Exception:
         return None, None
+
 
 def fetch_lyrics_lrclib(song_name, artist_name):
-    url = "https://lrclib.net/api/get"
-    params = {"track_name": song_name, "artist_name": artist_name}
+    """Try the exact endpoint first, then fall back to the fuzzy search."""
     headers = {"User-Agent": "NLP_Streamlit_App/1.0"}
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(
+            "https://lrclib.net/api/get",
+            params={"track_name": song_name, "artist_name": artist_name},
+            headers=headers,
+            timeout=10,
+        )
         if response.status_code == 200:
-            return response.json().get("plainLyrics")
-        return None
-    except Exception as e:
-        return None
+            lyrics = response.json().get("plainLyrics")
+            if lyrics:
+                return lyrics
 
-# ==========================================
-# 5. NLP PROCESSING FUNCTIONS
-# ==========================================
-def calculate_cefr_level(text):
-    grade = textstat.flesch_kincaid_grade(text)
-    if grade <= 4: return "A1 (Beginner)"
-    elif grade <= 6: return "A2 (Elementary)"
-    elif grade <= 8: return "B1 (Intermediate)"
-    elif grade <= 10: return "B2 (Upper Intermediate)"
-    elif grade <= 12: return "C1 (Advanced)"
-    else: return "C2 (Proficient)"
-
-def analyze_sentiment_transformer(text):
-    """Uses a Deep Learning model to classify overall sentiment."""
-    # Truncate text to 512 characters to avoid exceeding Transformer token limits on long songs
-    truncated_text = text[:512] 
-    try:
-        result = sentiment_pipeline(truncated_text)[0]
-        label = result['label']
-        score = result['score']
-        
-        if label == "POSITIVE":
-            return "Positive 🟢", score
-        else:
-            return "Negative 🔴", score
+        response = requests.get(
+            "https://lrclib.net/api/search",
+            params={"track_name": song_name, "artist_name": artist_name},
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code == 200:
+            for hit in response.json():
+                if hit.get("plainLyrics"):
+                    return hit["plainLyrics"]
     except Exception:
-        return "Neutral ⚪", 0.0
+        pass
+    return None
 
-def extract_highlights(text):
-    doc = nlp(text.lower())
-    highlights = []
-    
-    # 1. Extract Phrasal Verbs
-    for token in doc:
-        if token.pos_ == "VERB":
-            for child in token.children:
-                if child.dep_ == "prt": 
-                    phrasal_verb = f"{token.text} {child.text}"
-                    # Lookup specific meaning or use fallback
-                    meaning = PHRASAL_VERBS_DICT.get(phrasal_verb, "Verb + Particle combination (Context dependent)")
-                    highlights.append({
-                        "Type": "Phrasal Verb",
-                        "Word": phrasal_verb,
-                        "Meaning": meaning,
-                        "Confidence": "High (spaCy Dep Parsing)",
-                        "Position": token.idx
-                    })
-    
-    # 2. Extract Slangs / Idioms
-    for slang, meaning in SLANG_DICT.items():
-        for match in re.finditer(rf"\b{slang}\b", text.lower()):
-            highlights.append({
-                "Type": "Slang / Idiom",
-                "Word": slang,
-                "Meaning": meaning,
-                "Confidence": "High (Dictionary Match)",
-                "Position": match.start()
-            })
 
-    # 3. Extract Contractions
-    for pattern, meaning in CONTRACTIONS_DICT.items():
-        for match in re.finditer(pattern, text.lower()):
-            highlights.append({
-                "Type": "Contraction",
-                "Word": match.group(0),
-                "Meaning": meaning,
-                "Confidence": "High (Regex Match)",
-                "Position": match.start()
-            })
-            
-    return sorted(highlights, key=lambda x: x["Position"])
+def store_result(song, artist, lyrics):
+    st.session_state.lyrics_data = {"song": song, "artist": artist, "lyrics": lyrics}
+    st.session_state.selected_vocab = None
 
-def process_lexical_diversity_and_freq(text):
-    words = word_tokenize(text.lower())
-    stop_words = set(stopwords.words('english'))
-    valid_words = [w for w in words if w.isalpha()]
-    meaningful_words = [w for w in valid_words if w not in stop_words]
-    
-    unique_words = len(set(valid_words))
-    total_words = len(valid_words)
-    diversity = (unique_words / total_words) * 100 if total_words > 0 else 0
-    freq_dist = Counter(meaningful_words)
-    return diversity, freq_dist, set(valid_words)
 
-def highlight_text_html(text, highlights):
-    highlighted_text = text
-    sorted_highlights = sorted(highlights, key=lambda x: len(x["Word"]), reverse=True)
-    
-    for h in sorted_highlights:
-        word = h["Word"]
-        meaning = h["Meaning"]
-        category = h["Type"]
-        color = "#ffb7b2" if category == "Phrasal Verb" else "#b2e2f2" if category == "Contraction" else "#e2f0cb"
-        
-        replacement = f'<mark title="{category}: {meaning}" style="background-color: {color}; border-radius: 3px; padding: 0 2px; cursor: help;">{word}</mark>'
-        highlighted_text = re.sub(rf"(?i)\b{re.escape(word)}\b", replacement, highlighted_text)
-        
-    return highlighted_text.replace("\n", "<br>")
+# ==========================================================================
+# 3. SIDEBAR
+# ==========================================================================
+with st.sidebar:
+    st.header("⚙️ Analysis options")
 
-# ==========================================
-# 6. USER INTERFACE & STATE TRIGGERING
-# ==========================================
+    active_categories = st.multiselect(
+        "Highlight in the lyrics",
+        options=CATEGORY_ORDER,
+        default=CATEGORY_ORDER,
+        help="Turn a category off to focus on one learning objective at a time.",
+    )
+
+    show_emotions = st.checkbox(
+        "Detect emotions (joy, sadness, anger...)",
+        value=False,
+        help="Adds a second Transformer model. The first run downloads about 330 MB.",
+    )
+
+    st.divider()
+    st.subheader("Legend")
+    for category in CATEGORY_ORDER:
+        st.markdown(
+            f'<span style="background-color:{CATEGORY_COLORS[category]};color:#111;'
+            f'padding:2px 8px;border-radius:4px;font-weight:600;">{category}</span>'
+            f'<br><span style="font-size:0.82em;opacity:0.8;">{CATEGORY_HELP[category]}</span>',
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+
+# ==========================================================================
+# 4. SEARCH
+# ==========================================================================
 st.title("🎵 NLP Lyrics Analyzer")
-st.markdown("Extract lyrics and perform advanced **Natural Language Processing** for language learning.")
+st.markdown(
+    "Turn any English song into a lesson: **contractions**, **reduced forms**, "
+    "**phrasal verbs**, **idioms** and **slang**, explained in context."
+)
 
-tab1, tab2 = st.tabs(["🔍 Search by Song Name", "🔗 Search by Spotify Link"])
+tab_name, tab_link = st.tabs(["🔍 Search by song name", "🔗 Search by Spotify link"])
 
-with tab1:
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        search_input = st.text_input("Enter Song Name & Artist:", key="name_input")
-    with col2:
-        st.write("") 
-        st.write("") 
-        if st.button("Search Name", use_container_width=True):
+with tab_name:
+    col_input, col_button = st.columns([4, 1])
+    with col_input:
+        search_input = st.text_input("Song name & artist:", key="name_input")
+    with col_button:
+        st.write("")
+        st.write("")
+        if st.button("Search", use_container_width=True):
             with st.spinner("Searching Spotify..."):
-                extracted_name, extracted_artist = search_spotify_by_name(search_input)
-                if extracted_name:
-                    lyrics = fetch_lyrics_lrclib(extracted_name, extracted_artist)
-                    # SAVE TO SESSION STATE
-                    st.session_state.lyrics_data = {
-                        "song": extracted_name,
-                        "artist": extracted_artist,
-                        "lyrics": lyrics
-                    }
-                    st.session_state.selected_vocab = None # Reset vocab on new search
-                else:
-                    st.error("Song not found.")
+                name, artist = search_spotify_by_name(search_input)
+            if name:
+                with st.spinner("Fetching lyrics..."):
+                    store_result(name, artist, fetch_lyrics_lrclib(name, artist))
+            else:
+                st.error("Song not found.")
 
-with tab2:
-    col1, col2 = st.columns([4, 1])
-    with col1:
-        link_input = st.text_input("Enter Spotify Link:", key="link_input")
-    with col2:
-        st.write("") 
-        st.write("") 
-        if st.button("Analyze Link", use_container_width=True):
+with tab_link:
+    col_input, col_button = st.columns([4, 1])
+    with col_input:
+        link_input = st.text_input("Spotify track link:", key="link_input")
+    with col_button:
+        st.write("")
+        st.write("")
+        if st.button("Analyze", use_container_width=True):
             track_id = extract_spotify_id(link_input)
             if track_id:
-                with st.spinner("Fetching Metadata..."):
-                    extracted_name, extracted_artist = fetch_spotify_metadata_by_id(track_id)
-                    if extracted_name:
-                        lyrics = fetch_lyrics_lrclib(extracted_name, extracted_artist)
-                        # SAVE TO SESSION STATE
-                        st.session_state.lyrics_data = {
-                            "song": extracted_name,
-                            "artist": extracted_artist,
-                            "lyrics": lyrics
-                        }
-                        st.session_state.selected_vocab = None
+                with st.spinner("Fetching metadata..."):
+                    name, artist = fetch_spotify_metadata_by_id(track_id)
+                if name:
+                    with st.spinner("Fetching lyrics..."):
+                        store_result(name, artist, fetch_lyrics_lrclib(name, artist))
+                else:
+                    st.error("Track not found on Spotify.")
             else:
-                st.error("Invalid Spotify Link format.")
+                st.error("Invalid Spotify link format.")
 
 st.divider()
 
-# ==========================================
-# 7. RENDER DASHBOARD (FROM SESSION STATE)
-# ==========================================
-# By checking session_state, the dashboard stays visible even if the user clicks a vocab button
-if st.session_state.lyrics_data:
-    data = st.session_state.lyrics_data
-    song_name = data["song"]
-    artist_name = data["artist"]
-    lyrics = data["lyrics"]
-    
-    st.success(f"Track Identified: **{song_name}** by **{artist_name}**")
-    
-    if lyrics:
-        # Run NLP Functions
-        cefr_level = calculate_cefr_level(lyrics)
-        sentiment_label, sentiment_score = analyze_sentiment_transformer(lyrics)
-        highlights = extract_highlights(lyrics)
-        diversity, freq_dist, unique_words_set = process_lexical_diversity_and_freq(lyrics)
-        
-        try:
-            primary_lang = detect(lyrics)
-        except:
-            primary_lang = "unknown"
+# ==========================================================================
+# 5. DASHBOARD
+# ==========================================================================
+if not st.session_state.lyrics_data:
+    st.info("Search for a song above to start the analysis.")
+    st.stop()
 
-        st.header("📊 NLP Dashboard")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("CEFR Difficulty Level", cefr_level)
-        m2.metric("Overall Sentiment", sentiment_label, f"Confidence: {sentiment_score:.2f}")
-        m3.metric("Lexical Diversity", f"{diversity:.1f}%")
-        m4.metric("Primary Language", primary_lang.upper())
-        
-        st.divider()
+data = st.session_state.lyrics_data
+song_name, artist_name, raw_lyrics = data["song"], data["artist"], data["lyrics"]
 
-        lyric_col, data_col = st.columns([1.5, 1.5])
-        
-        with lyric_col:
-            st.subheader("Interactive Lyrics")
-            st.caption("Hover over highlighted words to see their meaning.")
-            html_lyrics = highlight_text_html(lyrics, highlights)
-            st.markdown(f'<div style="background-color: #1e1e1e; padding: 20px; border-radius: 10px; font-family: sans-serif; line-height: 1.8; color: #ffffff; height: 500px; overflow-y: scroll;">{html_lyrics}</div>', unsafe_allow_html=True)
-            
-            st.markdown("""
-            **Legend:** 
-            <span style="background-color:#ffb7b2; color:black; padding:2px 5px; border-radius:3px;">Phrasal Verb</span>
-            <span style="background-color:#b2e2f2; color:black; padding:2px 5px; border-radius:3px;">Contraction</span>
-            <span style="background-color:#e2f0cb; color:black; padding:2px 5px; border-radius:3px;">Slang/Idiom</span>
-            """, unsafe_allow_html=True)
+st.success(f"Track identified: **{song_name}** by **{artist_name}**")
 
-        with data_col:
-            st.subheader("Extracted Features Details")
-            if highlights:
-                df_highlights = pd.DataFrame(highlights).drop_duplicates(subset=['Word'])
-                st.dataframe(df_highlights[['Type', 'Word', 'Meaning', 'Confidence']], use_container_width=True, hide_index=True)
-            else:
-                st.info("No specific idioms, contractions, or phrasal verbs found.")
-            
-            st.subheader("Top Word Frequencies")
-            df_freq = pd.DataFrame(freq_dist.most_common(10), columns=["Word", "Frequency"])
-            st.bar_chart(df_freq.set_index("Word"))
+if not raw_lyrics or not raw_lyrics.strip():
+    st.error("Lyrics could not be found for this track (it may be instrumental).")
+    st.stop()
 
-        st.divider()
+result = engine.analyze_lyrics(raw_lyrics)
+lyrics = result["text"]
+spans = result["spans"]
+sentiment = result["sentiment"]
+lexical = result["lexical"]
 
-        # ==========================================
-        # 8. DICTIONARY BUTTONS GRID
-        # ==========================================
-        st.header("📖 Vocabulary Search")
-        st.write("Click a word to translate it and find synonyms.")
-        
-        word_list = sorted(list(unique_words_set))
-        
-        # Create a grid of buttons. 8 buttons per row.
-        cols = st.columns(8)
-        for i, word in enumerate(word_list):
-            with cols[i % 8]:
-                # If a button is clicked, it updates the session state
-                if st.button(word, key=f"btn_{word}", use_container_width=True):
-                    st.session_state.selected_vocab = word
+try:
+    language = detect(lyrics).upper()
+except Exception:
+    language = "UNKNOWN"
 
-        # Translation Logic based on the clicked button
-        if st.session_state.selected_vocab:
-            selected_word = st.session_state.selected_vocab
-            st.markdown(f"---")
-            st.markdown(f"### Analysis for: **{selected_word.upper()}**")
-            
-            trans_col, syn_col = st.columns(2)
-            with trans_col:
-                st.markdown("#### 🇧🇷 Portuguese Translation")
-                try:
-                    translator = GoogleTranslator(source='en', target='pt')
-                    translation = translator.translate(selected_word)
-                    st.info(f"➔ {translation}")
-                except Exception:
-                    st.error("Translation service temporarily unavailable.")
-            
-            with syn_col:
-                st.markdown("#### 🇺🇸 English Synonyms")
-                synonyms = set()
-                for syn in wordnet.synsets(selected_word):
-                    for lemma in syn.lemmas():
-                        synonyms.add(lemma.name().replace("_", " "))
-                
-                if selected_word in synonyms:
-                    synonyms.remove(selected_word)
-                    
-                if synonyms:
-                    st.success(", ".join(list(synonyms)[:8]))
+if language != "EN":
+    st.warning(
+        f"The detected language is **{language}**. The dictionaries and models "
+        "of this app are built for English, so the results may be unreliable."
+    )
+
+st.header("📊 NLP dashboard")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("CEFR difficulty", result["cefr"])
+m2.metric(
+    "Overall sentiment",
+    f"{sentiment['label']} {sentiment['emoji']}",
+    f"polarity {sentiment['score']:+.2f}",
+)
+m3.metric("Lexical diversity", f"{lexical['diversity']:.1f}%")
+m4.metric("Language", language)
+
+counts = result["counts"]
+count_cols = st.columns(len(CATEGORY_ORDER))
+for column, category in zip(count_cols, CATEGORY_ORDER):
+    column.metric(category, counts.get(category, 0))
+
+if result["readability"]:
+    with st.expander("How is the CEFR level calculated?"):
+        st.write(
+            "Lyrics arrive without punctuation, so each line is treated as one "
+            "sentence before the readability formulas are applied. The "
+            "Flesch-Kincaid grade is then adjusted by the share of words that "
+            "are outside the Dale-Chall list of familiar English words."
+        )
+        st.table(pd.DataFrame(result["readability"].items(), columns=["Metric", "Value"]))
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# 5a. Interactive lyrics + feature table
+# --------------------------------------------------------------------------
+lyric_col, data_col = st.columns([1.4, 1.6])
+
+with lyric_col:
+    st.subheader("Interactive lyrics")
+    st.caption("Hover over a highlighted expression to read its meaning.")
+    html_lyrics = engine.render_highlighted_html(lyrics, spans, set(active_categories))
+    st.markdown(
+        '<div style="background-color:#1e1e1e;padding:20px;border-radius:10px;'
+        'font-family:sans-serif;line-height:2;color:#ffffff;height:520px;'
+        f'overflow-y:auto;">{html_lyrics}</div>',
+        unsafe_allow_html=True,
+    )
+
+with data_col:
+    st.subheader("Extracted features")
+    if spans:
+        df = pd.DataFrame(spans)[["Type", "Word", "Meaning", "Source"]]
+        feature_tabs = st.tabs(["All"] + CATEGORY_ORDER)
+
+        with feature_tabs[0]:
+            st.dataframe(
+                df.drop_duplicates(subset=["Type", "Word"]),
+                use_container_width=True,
+                hide_index=True,
+                height=460,
+            )
+
+        for tab, category in zip(feature_tabs[1:], CATEGORY_ORDER):
+            with tab:
+                subset = df[df["Type"] == category].drop_duplicates(subset=["Word"])
+                if subset.empty:
+                    st.info(f"No {category.lower()} found in this song.")
                 else:
-                    st.warning("No standard synonyms found in WordNet.")
+                    st.caption(CATEGORY_HELP[category])
+                    st.dataframe(
+                        subset[["Word", "Meaning", "Source"]],
+                        use_container_width=True,
+                        hide_index=True,
+                        height=420,
+                    )
     else:
-        st.error("Lyrics could not be found.")
+        st.info("No contractions, phrasal verbs, idioms or slang were found.")
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# 5b. Sentiment
+# --------------------------------------------------------------------------
+st.header("💬 Sentiment analysis")
+st.caption(
+    "The song is split into passages and each one is scored separately, so a "
+    "song that starts hopeful and ends in heartbreak is not flattened into a "
+    "single label."
+)
+
+arc_col, emotion_col = st.columns(2)
+
+with arc_col:
+    st.subheader("Emotional arc")
+    if sentiment["arc"]:
+        arc_df = pd.DataFrame(
+            {"Polarity": sentiment["arc"]},
+            index=[f"P{i}" for i in range(1, len(sentiment["arc"]) + 1)],
+        )
+        st.area_chart(arc_df, height=260)
+        st.caption(
+            f"{sentiment['positive_passages']} positive passage(s), "
+            f"{sentiment['negative_passages']} negative passage(s). "
+            "+1 = fully positive, -1 = fully negative."
+        )
+
+        most_negative = min(range(len(sentiment["arc"])), key=lambda i: sentiment["arc"][i])
+        most_positive = max(range(len(sentiment["arc"])), key=lambda i: sentiment["arc"][i])
+        st.markdown("**Saddest passage**")
+        st.info(sentiment["chunks"][most_negative])
+        st.markdown("**Happiest passage**")
+        st.success(sentiment["chunks"][most_positive])
+    else:
+        st.info("Not enough text to build a sentiment arc.")
+
+with emotion_col:
+    st.subheader("Emotions")
+    if show_emotions:
+        with st.spinner("Classifying emotions..."):
+            emotions = engine.analyze_emotions(lyrics)
+        if emotions:
+            emotion_df = pd.DataFrame(emotions, columns=["Emotion", "Score"]).set_index(
+                "Emotion"
+            )
+            st.bar_chart(emotion_df, height=260)
+            top_label, top_score = emotions[0]
+            st.caption(
+                f"Dominant emotion: **{top_label}** ({top_score * 100:.0f}% average "
+                "confidence across the passages)."
+            )
+        else:
+            st.warning("The emotion model could not be loaded.")
+    else:
+        st.info("Enable *Detect emotions* in the sidebar to add a 7-emotion breakdown.")
+
+st.divider()
+
+# --------------------------------------------------------------------------
+# 5c. Vocabulary
+# --------------------------------------------------------------------------
+st.header("📖 Vocabulary")
+
+freq_col, word_col = st.columns([1, 1])
+
+with freq_col:
+    st.subheader("Most frequent content words")
+    frequencies = lexical["frequencies"].most_common(12)
+    if frequencies:
+        freq_df = pd.DataFrame(frequencies, columns=["Word", "Frequency"]).set_index("Word")
+        st.bar_chart(freq_df, height=300)
+        st.caption(
+            "Counted by lemma, so *love / loves / loving* are a single "
+            "vocabulary item, and function words are excluded."
+        )
+    else:
+        st.info("No content words to display.")
+
+with word_col:
+    st.subheader("Word lookup")
+    vocabulary = lexical["vocabulary"]
+    st.caption(f"{len(vocabulary)} distinct content words in this song.")
+
+    chosen = st.selectbox(
+        "Pick a word to translate:",
+        options=vocabulary,
+        index=None,
+        placeholder="Type to search...",
+    )
+    if chosen:
+        st.session_state.selected_vocab = chosen
+
+    st.write("Or pick one of the most frequent words:")
+    quick_words = [word for word, _ in frequencies[:8]]
+    quick_cols = st.columns(4)
+    for index, word in enumerate(quick_words):
+        with quick_cols[index % 4]:
+            if st.button(word, key=f"quick_{word}", use_container_width=True):
+                st.session_state.selected_vocab = word
+
+if st.session_state.selected_vocab:
+    selected_word = st.session_state.selected_vocab
+    st.markdown(f"### Analysis of **{selected_word.upper()}**")
+
+    trans_col, syn_col, def_col = st.columns(3)
+
+    with trans_col:
+        st.markdown("#### 🇧🇷 Portuguese")
+        try:
+            st.info(f"➔ {GoogleTranslator(source='en', target='pt').translate(selected_word)}")
+        except Exception:
+            st.error("Translation service temporarily unavailable.")
+
+    synsets = wordnet.synsets(selected_word)
+
+    with syn_col:
+        st.markdown("#### 🇺🇸 Synonyms")
+        synonyms = {
+            lemma.name().replace("_", " ")
+            for synset in synsets
+            for lemma in synset.lemmas()
+        }
+        synonyms.discard(selected_word)
+        if synonyms:
+            st.success(", ".join(sorted(synonyms)[:8]))
+        else:
+            st.warning("No synonyms found in WordNet.")
+
+    with def_col:
+        st.markdown("#### 📘 Definitions")
+        if synsets:
+            for synset in synsets[:3]:
+                st.write(f"*({synset.pos()})* {synset.definition()}")
+        else:
+            st.warning("No definition found in WordNet.")
