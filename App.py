@@ -25,9 +25,15 @@ def iniciar_clientes_api():
         spotify_client = spotipy.Spotify(auth_manager=auth_manager)
         
         # Credencial do Genius
-        genius_client = lyricsgenius.Genius(st.secrets["GENIUS_ACCESS_TOKEN"])
-        genius_client.verbose = False # Desativa logs desnecessários no terminal
-        genius_client.remove_section_headers = True # Remove [Chorus], [Verse], etc.
+        # Credencial do Genius com maior tolerância a falhas e nuvem
+        genius_client = lyricsgenius.Genius(
+            st.secrets["GENIUS_ACCESS_TOKEN"],
+            timeout=15,           # Aumenta o tempo de espera (default é 5s)
+            retries=3,            # Tenta 3 vezes antes de falhar
+            skip_non_songs=True   # Evita buscar coisas que não são músicas
+        )
+        genius_client.verbose = False
+        genius_client.remove_section_headers = True
         
         return spotify_client, genius_client
     except Exception as e:
