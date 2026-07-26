@@ -4,6 +4,7 @@ requests
 spacy>=3.7,<3.8
 nltk
 textstat
+numpy<2.0.0
 langdetect
 pandas
 deep-translator
