@@ -1,4 +1,4 @@
-streamlit>=1.31
+streamlit
 spotipy
 requests
 spacy>=3.7,<3.8
